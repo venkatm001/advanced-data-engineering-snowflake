@@ -1,0 +1,219 @@
+name: Deploy OpenFlow to Prod
+
+on:
+  # Auto-deploy when PR merged to main
+  push:
+    branches:
+      - main
+    paths:
+      - 'openflow/**'
+  
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      flow_name:
+        description: 'Flow name to deploy (e.g., salesforce-bulk-api)'
+        required: true
+        type: string
+      bucket:
+        description: 'Bucket (connectors or custom-flows)'
+        required: true
+        default: 'connectors'
+        type: choice
+        options:
+          - connectors
+          - custom-flows
+      action:
+        description: 'Deployment action'
+        required: true
+        default: 'update'
+        type: choice
+        options:
+          - update    # Update existing flow to latest version
+          - deploy    # Deploy new flow (first time)
+          - rollback  # Rollback to previous version
+
+env:
+  PYTHON_VERSION: '3.11'
+  NIPYAPI_VERSION: '1.5.0'
+
+jobs:
+  deploy:
+    name: Deploy to Prod
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval if configured
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need previous commit for change detection
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install "nipyapi[cli]==${{ env.NIPYAPI_VERSION }}" requests
+
+      - name: Configure nipyapi profile
+        run: |
+          mkdir -p ~/.nipyapi
+          cat > ~/.nipyapi/profiles.yml << EOF
+          prod:
+            nifi_url: "${{ secrets.OPENFLOW_PROD_URL }}"
+            nifi_bearer_token: "${{ secrets.SNOWFLAKE_PAT }}"
+          EOF
+
+      - name: Verify connection to OpenFlow
+        run: |
+          echo "Testing connection to OpenFlow Prod..."
+          nipyapi --profile prod system get_nifi_version_info || {
+            echo "::error::Failed to connect to OpenFlow Prod. Check OPENFLOW_PROD_URL and SNOWFLAKE_PAT secrets."
+            exit 1
+          }
+
+      # For automatic deployments (push to main)
+      - name: Detect changed flows
+        if: github.event_name == 'push'
+        id: changes
+        run: |
+          echo "Detecting changed flows..."
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'openflow/' | grep '\.json$' || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No flow definition changes detected"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changed flows:"
+            echo "$CHANGED_FILES"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            
+            # Extract flow names from paths (openflow/connectors/flow-name.json -> flow-name)
+            FLOWS=$(echo "$CHANGED_FILES" | xargs -I {} basename {} .json | sort -u)
+            echo "flows<<EOF" >> $GITHUB_OUTPUT
+            echo "$FLOWS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy changed flows (auto)
+        if: github.event_name == 'push' && steps.changes.outputs.has_changes == 'true'
+        run: |
+          echo "Deploying changed flows to Prod..."
+          
+          FLOWS="${{ steps.changes.outputs.flows }}"
+          for flow in $FLOWS; do
+            echo "----------------------------------------"
+            echo "Updating flow: $flow"
+            
+            # Check if flow exists in Prod
+            EXISTING=$(nipyapi --profile prod ci list_flows 2>/dev/null | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for pg in data.get('process_groups', []):
+              if pg.get('flow_name') == '$flow':
+                  print(pg.get('id'))
+                  break
+          " || echo "")
+            
+            if [ -n "$EXISTING" ]; then
+              echo "Flow exists (ID: $EXISTING), updating to latest version..."
+              nipyapi --profile prod ci change_flow_version --process_group_id "$EXISTING" || {
+                echo "::warning::Failed to update flow $flow"
+              }
+            else
+              echo "::notice::Flow $flow not deployed in Prod yet. Use manual deployment for first-time deploy."
+            fi
+          done
+
+      # For manual deployments (workflow_dispatch)
+      - name: Manual deployment
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          FLOW_NAME="${{ inputs.flow_name }}"
+          BUCKET="${{ inputs.bucket }}"
+          ACTION="${{ inputs.action }}"
+          
+          echo "Manual deployment requested"
+          echo "  Flow: $FLOW_NAME"
+          echo "  Bucket: $BUCKET"
+          echo "  Action: $ACTION"
+          echo "----------------------------------------"
+          
+          # Get existing flow ID if present
+          EXISTING=$(nipyapi --profile prod ci list_flows 2>/dev/null | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for pg in data.get('process_groups', []):
+              if pg.get('flow_name') == '$FLOW_NAME':
+                  print(pg.get('id'))
+                  break
+          " || echo "")
+          
+          case "$ACTION" in
+            deploy)
+              if [ -n "$EXISTING" ]; then
+                echo "::error::Flow already exists (ID: $EXISTING). Use 'update' action instead."
+                exit 1
+              fi
+              echo "Deploying new flow from registry..."
+              nipyapi --profile prod ci deploy_flow \
+                --registry_client github-snowflake \
+                --bucket "$BUCKET" \
+                --flow_name "$FLOW_NAME"
+              echo "::notice::Flow deployed successfully. Remember to configure parameter values in Prod!"
+              ;;
+              
+            update)
+              if [ -z "$EXISTING" ]; then
+                echo "::error::Flow not found in Prod. Use 'deploy' action for first-time deployment."
+                exit 1
+              fi
+              echo "Updating flow to latest version..."
+              nipyapi --profile prod ci change_flow_version --process_group_id "$EXISTING"
+              echo "::notice::Flow updated successfully."
+              ;;
+              
+            rollback)
+              if [ -z "$EXISTING" ]; then
+                echo "::error::Flow not found in Prod."
+                exit 1
+              fi
+              echo "Getting version history..."
+              VERSIONS=$(nipyapi --profile prod ci get_flow_versions --process_group_id "$EXISTING")
+              echo "$VERSIONS"
+              
+              # Get previous version (second in list)
+              PREV_VERSION=$(echo "$VERSIONS" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          versions = data.get('versions', [])
+          if len(versions) >= 2:
+              print(versions[1].get('version'))
+          ")
+              
+              if [ -z "$PREV_VERSION" ]; then
+                echo "::error::No previous version available for rollback."
+                exit 1
+              fi
+              
+              echo "Rolling back to version: $PREV_VERSION"
+              nipyapi --profile prod ci change_flow_version \
+                --process_group_id "$EXISTING" \
+                --target_version "$PREV_VERSION"
+              echo "::notice::Rollback completed."
+              ;;
+          esac
+
+      - name: Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "- **Flow:** ${{ inputs.flow_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action:** ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          fi
